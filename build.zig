@@ -50,174 +50,55 @@ const seven_zip_sources = [_][]const u8{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const shared = b.option(bool, "shared", "Build libunarr as a shared library") orelse false;
-    const enable_7z = b.option(bool, "enable_7z", "Enable 7z format support") orelse true;
-    const static_libc = b.option(bool, "static_libc", "Link against static ziglibc instead of system libc") orelse true;
-
-    const unarr_upstream = b.dependency("unarr_upstream", .{});
-
-    const generated_unarr_h = b.addConfigHeader(.{
-        .style = .{ .cmake = unarr_upstream.path("unarr.h.in") },
+    const shared = b.option(bool, "shared", "Build a shared library") orelse false;
+    const enable_7z = b.option(bool, "enable_7z", "Enable 7z decoding") orelse true;
+    const upstream = b.dependency("unarr_upstream", .{});
+    const header = b.addConfigHeader(.{
+        .style = .{ .cmake = upstream.path("unarr.h.in") },
         .include_path = "unarr.h",
     }, .{
-        .unarr_VERSION_MAJOR = @as(i64, @intCast(unarr_version.major)),
-        .unarr_VERSION_MINOR = @as(i64, @intCast(unarr_version.minor)),
-        .unarr_VERSION_PATCH = @as(i64, @intCast(unarr_version.patch)),
+        .unarr_VERSION_MAJOR = @as(i64, unarr_version.major),
+        .unarr_VERSION_MINOR = @as(i64, unarr_version.minor),
+        .unarr_VERSION_PATCH = @as(i64, unarr_version.patch),
         .unarr_VERSION = unarr_version_string,
     });
-
     const lib = b.addLibrary(.{
         .name = "unarr",
         .linkage = if (shared) .dynamic else .static,
         .version = unarr_version,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = !static_libc,
-            .sanitize_c = .off,
-        }),
+        .use_lld = true,
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
     });
-
-    lib.root_module.addIncludePath(unarr_upstream.path(""));
-    lib.root_module.addConfigHeader(generated_unarr_h);
+    lib.root_module.addIncludePath(upstream.path(""));
+    lib.root_module.addConfigHeader(header);
     lib.root_module.addCMacro("_FILE_OFFSET_BITS", "64");
     lib.root_module.addCMacro("UNARR_EXPORT_SYMBOLS", "1");
     if (shared) lib.root_module.addCMacro("UNARR_IS_SHARED_LIBRARY", "1");
-
-    lib.root_module.addCSourceFiles(.{
-        .root = unarr_upstream.path(""),
-        .files = &base_sources,
-        .flags = &.{"-std=c99"},
-    });
-
+    // The bundled LZMA SDK deliberately uses unaligned loads on supported CPUs.
+    lib.root_module.addCSourceFiles(.{ .root = upstream.path(""), .files = &base_sources, .flags = &.{ "-std=c99", "-fno-sanitize=alignment" } });
     if (enable_7z) {
         lib.root_module.addCMacro("HAVE_7Z", "1");
         lib.root_module.addCMacro("Z7_PPMD_SUPPORT", "1");
-        lib.root_module.addCSourceFiles(.{
-            .root = unarr_upstream.path(""),
-            .files = &seven_zip_sources,
-            .flags = &.{"-std=c99"},
-        });
+        lib.root_module.addCSourceFiles(.{ .root = upstream.path(""), .files = &seven_zip_sources, .flags = &.{ "-std=c99", "-fno-sanitize=alignment" } });
     }
-
-    const static_libc_artifact = if (static_libc) blk: {
-        const ziglibc_dep = b.lazyDependency("ziglibc", .{
-            .target = target,
-            .optimize = optimize,
-            .trace = false,
-        }) orelse return;
-
-        const ziglibc_lib = findDependencyArtifactByLinkage(ziglibc_dep, "cguana", .static);
-        configureStaticLibc(lib.root_module, ziglibc_lib, ziglibc_dep);
-        break :blk ziglibc_lib;
-    } else null;
-
-    lib.installConfigHeader(generated_unarr_h);
+    lib.installConfigHeader(header);
     b.installArtifact(lib);
-
-    var lib_for_tests = lib;
-    if (static_libc) {
-        const test_lib = b.addLibrary(.{
-            .name = "unarr_test",
-            .linkage = .static,
-            .version = unarr_version,
-            .root_module = b.createModule(.{
-                .target = target,
-                .optimize = optimize,
-                .link_libc = false,
-                .sanitize_c = .off,
-            }),
-        });
-        test_lib.root_module.addIncludePath(unarr_upstream.path(""));
-        test_lib.root_module.addConfigHeader(generated_unarr_h);
-        test_lib.root_module.addCMacro("_FILE_OFFSET_BITS", "64");
-        test_lib.root_module.addCMacro("UNARR_EXPORT_SYMBOLS", "1");
-        test_lib.root_module.addCSourceFiles(.{
-            .root = unarr_upstream.path(""),
-            .files = &base_sources,
-            .flags = &.{"-std=c99"},
-        });
-
-        if (enable_7z) {
-            test_lib.root_module.addCMacro("HAVE_7Z", "1");
-            test_lib.root_module.addCMacro("Z7_PPMD_SUPPORT", "1");
-            test_lib.root_module.addCSourceFiles(.{
-                .root = unarr_upstream.path(""),
-                .files = &seven_zip_sources,
-                .flags = &.{"-std=c99"},
-            });
-        }
-
-        if (static_libc_artifact) |_| {
-            const ziglibc_dep = b.lazyDependency("ziglibc", .{
-                .target = target,
-                .optimize = optimize,
-                .trace = false,
-            }) orelse return;
-            configureStaticLibc(test_lib.root_module, findDependencyArtifactByLinkage(ziglibc_dep, "cguana", .static), ziglibc_dep);
-        }
-
-        lib_for_tests = test_lib;
-    }
-
-    const zig_api = b.addModule("unarr", .{
+    const options = b.addOptions();
+    options.addOption(bool, "enable_7z", enable_7z);
+    const mod = b.addModule("unarr", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = !static_libc,
+        .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
     });
-    zig_api.addConfigHeader(generated_unarr_h);
-    if (static_libc_artifact) |artifact| {
-        const ziglibc_dep = b.lazyDependency("ziglibc", .{
-            .target = target,
-            .optimize = optimize,
-            .trace = false,
-        }) orelse return;
-        configureStaticLibc(zig_api, artifact, ziglibc_dep);
-    }
-    zig_api.linkLibrary(lib_for_tests);
-
-    const tests = b.addTest(.{
-        .root_module = zig_api,
-    });
-    const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run Zig API tests");
-    test_step.dependOn(&run_tests.step);
-
-    const check = b.step("check", "Compile libunarr without installing");
+    mod.addConfigHeader(header);
+    if (shared) mod.addCMacro("UNARR_IS_SHARED_LIBRARY", "1");
+    mod.linkLibrary(lib);
+    const tests = b.addTest(.{ .root_module = mod, .use_lld = true, .use_llvm = true });
+    const run = b.addRunArtifact(tests);
+    run.setCwd(b.path(""));
+    b.step("test", "Run archive behavior and ownership tests").dependOn(&run.step);
+    const check = b.step("check", "Compile library and tests");
     check.dependOn(&lib.step);
-}
-
-fn configureStaticLibc(module: *std.Build.Module, artifact: *std.Build.Step.Compile, dep: *std.Build.Dependency) void {
-    module.addIncludePath(dep.path("inc/libc"));
-    module.addIncludePath(dep.path("inc/posix"));
-    module.addIncludePath(dep.path("inc/gnu"));
-    module.linkLibrary(artifact);
-}
-
-fn findDependencyArtifactByLinkage(
-    dep: *std.Build.Dependency,
-    name: []const u8,
-    linkage: std.builtin.LinkMode,
-) *std.Build.Step.Compile {
-    var found: ?*std.Build.Step.Compile = null;
-    for (dep.builder.install_tls.step.dependencies.items) |dep_step| {
-        const install_artifact = dep_step.cast(std.Build.Step.InstallArtifact) orelse continue;
-        if (!std.mem.eql(u8, install_artifact.artifact.name, name)) continue;
-        if (install_artifact.artifact.linkage != linkage) continue;
-
-        if (found != null) {
-            std.debug.panic(
-                "artifact '{s}' with linkage '{s}' is ambiguous in dependency",
-                .{ name, @tagName(linkage) },
-            );
-        }
-        found = install_artifact.artifact;
-    }
-
-    if (found) |artifact| return artifact;
-    std.debug.panic(
-        "unable to find artifact '{s}' with linkage '{s}' in dependency install graph",
-        .{ name, @tagName(linkage) },
-    );
+    check.dependOn(&tests.step);
 }

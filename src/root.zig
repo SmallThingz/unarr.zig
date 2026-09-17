@@ -11,9 +11,16 @@ pub const Error = error{
     DecompressFailed,
     EntryTooLarge,
     OutOfMemory,
+    InvalidPath,
+    InvalidOffset,
+    StaleEntry,
+    EndOfEntry,
+    UnsupportedFormat,
+    InvalidUtf8,
 };
 
 pub const Format = enum {
+    auto,
     rar,
     tar,
     zip,
@@ -43,11 +50,25 @@ pub const Archive = struct {
     stream: *c.ar_stream,
     archive: *c.ar_archive,
     owns_stream: bool,
+    generation: u64 = 0,
+    consumed: usize = 0,
+    read_failed: bool = false,
 
-    pub fn openFile(format: Format, path: [:0]const u8, options: OpenOptions) Error!Archive {
-        const stream = c.ar_open_file(path.ptr) orelse return error.OpenStreamFailed;
+    /// Opens a UTF-8 path. The temporary terminated path is freed before return.
+    pub fn openFile(allocator: std.mem.Allocator, format: Format, path: []const u8, options: OpenOptions) Error!Archive {
+        if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+        const stream = if (@import("builtin").os.tag == .windows) blk: {
+            const wide_path = std.unicode.utf8ToUtf16LeAllocZ(allocator, path) catch |err| return switch (err) {
+                error.InvalidUtf8 => error.InvalidUtf8,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+            defer allocator.free(wide_path);
+            break :blk c.ar_open_file_w(wide_path.ptr) orelse return error.OpenStreamFailed;
+        } else c.ar_open_file(path_z.ptr) orelse return error.OpenStreamFailed;
         errdefer c.ar_close(stream);
-        const archive = openArchive(format, stream, options) orelse return error.OpenArchiveFailed;
+        const archive = try openArchive(format, stream, options);
         return .{
             .stream = stream,
             .archive = archive,
@@ -59,7 +80,7 @@ pub const Archive = struct {
         if (data.len == 0) return error.OpenStreamFailed;
         const stream = c.ar_open_memory(data.ptr, data.len) orelse return error.OpenStreamFailed;
         errdefer c.ar_close(stream);
-        const archive = openArchive(format, stream, options) orelse return error.OpenArchiveFailed;
+        const archive = try openArchive(format, stream, options);
         return .{
             .stream = stream,
             .archive = archive,
@@ -68,7 +89,7 @@ pub const Archive = struct {
     }
 
     pub fn openStream(format: Format, stream: *c.ar_stream, options: OpenOptions) Error!Archive {
-        const archive = openArchive(format, stream, options) orelse return error.OpenArchiveFailed;
+        const archive = try openArchive(format, stream, options);
         return .{
             .stream = stream,
             .archive = archive,
@@ -82,21 +103,56 @@ pub const Archive = struct {
     }
 
     pub fn nextEntry(self: *Archive) Error!?Entry {
+        self.invalidateEntry();
         if (c.ar_parse_entry(self.archive)) {
-            return Entry{ .archive = self };
+            return currentEntry(self);
         }
         if (c.ar_at_eof(self.archive)) return null;
         return error.ParseFailed;
     }
 
     pub fn parseEntryAt(self: *Archive, offset: i64) Error!void {
+        if (offset < 0) return error.InvalidOffset;
+        self.invalidateEntry();
         if (!c.ar_parse_entry_at(self.archive, @as(c.off64_t, @intCast(offset)))) {
             return error.ParseFailed;
         }
     }
 
     pub fn parseEntryFor(self: *Archive, name: [:0]const u8) bool {
+        self.invalidateEntry();
         return c.ar_parse_entry_for(self.archive, name.ptr);
+    }
+
+    pub fn next(self: *Archive) Error!?Entry {
+        return self.nextEntry();
+    }
+
+    /// Restarts iteration and finds an exact UTF-8 name without sentinel strings.
+    pub fn find(self: *Archive, name: []const u8) Error!?Entry {
+        self.invalidateEntry();
+        if (!c.ar_parse_entry_at(self.archive, 0)) {
+            if (c.ar_at_eof(self.archive)) return null;
+            return error.ParseFailed;
+        }
+        while (true) {
+            const entry = currentEntry(self);
+            if (entry.name()) |entry_name| {
+                if (std.mem.eql(u8, entry_name, name)) return entry;
+            }
+            if (try self.next() == null) return null;
+        }
+    }
+
+    pub fn seek(self: *Archive, offset: i64) Error!Entry {
+        try self.parseEntryAt(offset);
+        return currentEntry(self);
+    }
+
+    fn invalidateEntry(self: *Archive) void {
+        self.generation +%= 1;
+        self.consumed = 0;
+        self.read_failed = false;
     }
 
     pub fn atEof(self: *Archive) bool {
@@ -119,38 +175,70 @@ pub const OpenOptions = struct {
 
 pub const Entry = struct {
     archive: *Archive,
+    generation: u64,
+    byte_size: usize,
+    entry_offset: i64,
+    modified_filetime: i64,
 
     pub fn name(self: Entry) ?[]const u8 {
+        if (self.generation != self.archive.generation) return null;
         const ptr = c.ar_entry_get_name(self.archive.archive) orelse return null;
         return zStr(ptr);
     }
 
     pub fn rawName(self: Entry) ?[]const u8 {
+        if (self.generation != self.archive.generation) return null;
         const ptr = c.ar_entry_get_raw_name(self.archive.archive) orelse return null;
         return zStr(ptr);
     }
 
     pub fn offset(self: Entry) i64 {
-        return @as(i64, @intCast(c.ar_entry_get_offset(self.archive.archive)));
+        return self.entry_offset;
     }
 
     pub fn size(self: Entry) usize {
-        return c.ar_entry_get_size(self.archive.archive);
+        return self.byte_size;
     }
 
     pub fn filetime(self: Entry) i64 {
-        return @as(i64, @intCast(c.ar_entry_get_filetime(self.archive.archive)));
+        return self.modified_filetime;
     }
 
     pub fn read(self: Entry, out: []u8) Error!void {
+        const left = try self.remaining();
+        if (self.archive.read_failed) return error.DecompressFailed;
+        if (out.len > left) return error.EndOfEntry;
         if (out.len == 0) return;
         if (!c.ar_entry_uncompress(self.archive.archive, out.ptr, out.len)) {
+            self.archive.read_failed = true;
             return error.DecompressFailed;
+        }
+        self.archive.consumed += out.len;
+    }
+
+    pub fn remaining(self: Entry) Error!usize {
+        if (self.generation != self.archive.generation) return error.StaleEntry;
+        return self.byte_size - self.archive.consumed;
+    }
+
+    /// Reads up to the supplied buffer length; zero denotes entry EOF.
+    pub fn readSome(self: Entry, out: []u8) Error!usize {
+        const count = @min(out.len, try self.remaining());
+        try self.read(out[0..count]);
+        return count;
+    }
+
+    pub fn writeTo(self: Entry, writer: *std.Io.Writer) (Error || std.Io.Writer.Error)!void {
+        var buffer: [8192]u8 = undefined;
+        while (true) {
+            const count = try self.readSome(&buffer);
+            if (count == 0) return;
+            try writer.writeAll(buffer[0..count]);
         }
     }
 
     pub fn readAlloc(self: Entry, allocator: std.mem.Allocator, limit: usize) Error![]u8 {
-        const n = self.size();
+        const n = try self.remaining();
         if (n > limit) return error.EntryTooLarge;
         const out = allocator.alloc(u8, n) catch return error.OutOfMemory;
         errdefer allocator.free(out);
@@ -159,13 +247,27 @@ pub const Entry = struct {
     }
 };
 
-fn openArchive(format: Format, stream: *c.ar_stream, options: OpenOptions) ?*c.ar_archive {
+fn openArchive(format: Format, stream: *c.ar_stream, options: OpenOptions) Error!*c.ar_archive {
+    if (format == .@"7z" and !@import("build_options").enable_7z) return error.UnsupportedFormat;
+    if (format == .auto) {
+        const formats = [_]Format{ .zip, .rar, .@"7z", .tar };
+        for (formats) |candidate| {
+            if (candidate == .@"7z" and !@import("build_options").enable_7z) continue;
+            if (!c.ar_seek(stream, 0, 0)) return error.OpenStreamFailed;
+            return openArchive(candidate, stream, options) catch |err| switch (err) {
+                error.OpenArchiveFailed => continue,
+                else => return err,
+            };
+        }
+        return error.OpenArchiveFailed;
+    }
     return switch (format) {
+        .auto => unreachable,
         .rar => c.ar_open_rar_archive(stream),
         .tar => c.ar_open_tar_archive(stream),
         .zip => c.ar_open_zip_archive(stream, options.zip_deflated_only),
         .@"7z" => c.ar_open_7z_archive(stream),
-    };
+    } orelse error.OpenArchiveFailed;
 }
 
 fn zStr(ptr: [*c]const u8) []const u8 {
@@ -173,7 +275,13 @@ fn zStr(ptr: [*c]const u8) []const u8 {
 }
 
 fn currentEntry(archive: *Archive) Entry {
-    return .{ .archive = archive };
+    return .{
+        .archive = archive,
+        .generation = archive.generation,
+        .byte_size = c.ar_entry_get_size(archive.archive),
+        .entry_offset = c.ar_entry_get_offset(archive.archive),
+        .modified_filetime = c.ar_entry_get_filetime(archive.archive),
+    };
 }
 
 fn appendLe16(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u16) !void {
@@ -352,6 +460,71 @@ test "runtime version matches generated header values" {
     try std.testing.expectEqualStrings("1.2.0", v.string);
 }
 
+test "automatic format detection streams remaining bytes and invalidates stale entries" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildTarFixture(allocator, &.{
+        .{ .name = "first.txt", .data = "abcdef" },
+        .{ .name = "second.txt", .data = "1234" },
+    });
+    defer allocator.free(bytes);
+    var archive = try Archive.openMemory(.auto, bytes, .{});
+    defer archive.deinit();
+    const first = (try archive.next()).?;
+    var prefix: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try first.readSome(&prefix));
+    try std.testing.expectEqualStrings("ab", &prefix);
+    try std.testing.expectEqual(@as(usize, 4), try first.remaining());
+    const rest = try first.readAlloc(allocator, 4);
+    defer allocator.free(rest);
+    try std.testing.expectEqualStrings("cdef", rest);
+    try std.testing.expectEqual(@as(usize, 0), try first.readSome(&prefix));
+    try std.testing.expectError(error.EndOfEntry, first.read(&prefix));
+    const second = (try archive.next()).?;
+    try std.testing.expectError(error.StaleEntry, first.readSome(&prefix));
+    try std.testing.expect(first.name() == null);
+    try std.testing.expectEqual(@as(usize, 6), first.size());
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    try second.writeTo(&output.writer);
+    try std.testing.expectEqualStrings("1234", output.written());
+    const found = (try archive.find("first.txt")).?;
+    const all = try found.readAlloc(allocator, 6);
+    defer allocator.free(all);
+    try std.testing.expectEqualStrings("abcdef", all);
+    try std.testing.expectError(error.InvalidOffset, archive.seek(-1));
+    try std.testing.expect((try archive.find("missing.txt")) == null);
+    try std.testing.expectError(error.StaleEntry, found.remaining());
+}
+
+test "bounded extraction and allocation failure leave entry readable" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildZipSingleFileFixture(allocator, "a.txt", "allocated data", "");
+    defer allocator.free(bytes);
+    var archive = try Archive.openMemory(.auto, bytes, .{});
+    defer archive.deinit();
+    const entry = (try archive.next()).?;
+    try std.testing.expectError(error.EntryTooLarge, entry.readAlloc(allocator, 1));
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, entry.readAlloc(failing.allocator(), 100));
+    const value = try entry.readAlloc(allocator, 100);
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("allocated data", value);
+    try std.testing.expectError(error.InvalidPath, Archive.openFile(allocator, .auto, "file\x00.zip", .{}));
+}
+
+test "corrupt entry bytes fail checksum and poison only the current read cursor" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildZipSingleFileFixture(allocator, "a.txt", "original", "");
+    defer allocator.free(bytes);
+    bytes[30 + "a.txt".len] ^= 1;
+    var archive = try Archive.openMemory(.auto, bytes, .{});
+    defer archive.deinit();
+    const entry = (try archive.next()).?;
+    try std.testing.expectError(error.DecompressFailed, entry.readAlloc(allocator, 100));
+    var buffer: [1]u8 = undefined;
+    try std.testing.expectError(error.DecompressFailed, entry.read(&buffer));
+}
+
 test "open memory rejects empty slices" {
     try std.testing.expectError(error.OpenStreamFailed, Archive.openMemory(.zip, "", .{}));
     try std.testing.expectError(error.OpenStreamFailed, Archive.openMemory(.tar, "", .{}));
@@ -364,7 +537,7 @@ test "invalid bytes are rejected for all formats" {
     try std.testing.expectError(error.OpenArchiveFailed, Archive.openMemory(.zip, bogus, .{}));
     try std.testing.expectError(error.OpenArchiveFailed, Archive.openMemory(.tar, bogus, .{}));
     try std.testing.expectError(error.OpenArchiveFailed, Archive.openMemory(.rar, bogus, .{}));
-    try std.testing.expectError(error.OpenArchiveFailed, Archive.openMemory(.@"7z", bogus, .{}));
+    try std.testing.expectError(if (@import("build_options").enable_7z) error.OpenArchiveFailed else error.UnsupportedFormat, Archive.openMemory(.@"7z", bogus, .{}));
 }
 
 test "zip fixture supports entry reading, offsets, and comments" {
@@ -447,7 +620,7 @@ test "openFile works with generated zip fixture" {
     const abs_path_z = try allocator.dupeZ(u8, abs_path);
     defer allocator.free(abs_path_z);
 
-    var archive = try Archive.openFile(.zip, abs_path_z, .{});
+    var archive = try Archive.openFile(allocator, .zip, abs_path_z, .{});
     defer archive.deinit();
 
     const entry = (try archive.nextEntry()) orelse return error.TestUnexpectedResult;
@@ -545,7 +718,7 @@ test "real zip fixture from disk decompresses deflate entries" {
     const path_z = try allocator.dupeZ(u8, "testdata/archives/real-deflate.zip");
     defer allocator.free(path_z);
 
-    var archive = try Archive.openFile(.zip, path_z, .{});
+    var archive = try Archive.openFile(allocator, .zip, path_z, .{});
     defer archive.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), archive.globalCommentSize());
@@ -600,7 +773,7 @@ test "real tar fixture from disk parses entries" {
     const path_z = try allocator.dupeZ(u8, "testdata/archives/real.tar");
     defer allocator.free(path_z);
 
-    var archive = try Archive.openFile(.tar, path_z, .{});
+    var archive = try Archive.openFile(allocator, .tar, path_z, .{});
     defer archive.deinit();
 
     const first = (try archive.nextEntry()) orelse return error.TestUnexpectedResult;
@@ -625,6 +798,7 @@ test "real tar fixture from disk parses entries" {
 }
 
 test "real 7z fixture from disk decompresses entries" {
+    if (!@import("build_options").enable_7z) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const real_alpha = try readFixtureFile(allocator, "testdata/src/alpha.txt");
     defer allocator.free(real_alpha);
@@ -634,7 +808,7 @@ test "real 7z fixture from disk decompresses entries" {
     const path_z = try allocator.dupeZ(u8, "testdata/archives/real.7z");
     defer allocator.free(path_z);
 
-    var archive = try Archive.openFile(.@"7z", path_z, .{});
+    var archive = try Archive.openFile(allocator, .@"7z", path_z, .{});
     defer archive.deinit();
 
     try expectNamedEntryData(&archive, allocator, "alpha.txt", real_alpha);
@@ -642,6 +816,7 @@ test "real 7z fixture from disk decompresses entries" {
 }
 
 test "real 7z fixture in memory iterates entries" {
+    if (!@import("build_options").enable_7z) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const archive_bytes = try readFixtureFile(allocator, "testdata/archives/real.7z");
     defer allocator.free(archive_bytes);

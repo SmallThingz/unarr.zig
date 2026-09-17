@@ -25,7 +25,7 @@
     .fingerprint = 0xc6feb2e103574af5, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0-dev.2905+5d71e3051",
+    .minimum_zig_version = "0.16.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -36,15 +36,13 @@
             .url = "https://github.com/selmf/unarr/archive/00799b5d6a7456eff37276ad376d1715ee222e02.tar.gz",
             .hash = "N-V-__8AABWMCgDgDrwfEHLcf0rwMuWfSTEMZsTxuSs3oRJs",
         },
-        .ziglibc = .{
-            .url = "https://github.com/SmallThingz/ziglibc/archive/f7498cf373a9fe67787664f6917bf15df2f68aeb.tar.gz",
-            .hash = "N-V-__8AAOg8CgBsWJ9s3O7sKDdMR56qqkTUlWl4nZjhXq5Z",
-            .lazy = true,
-        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "README.md",
+        "DOCUMENTATION.md",
+        "LICENSE",
         "src",
         "testdata",
     },
