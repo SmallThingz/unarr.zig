@@ -53,6 +53,7 @@ pub const Archive = struct {
     generation: u64 = 0,
     consumed: usize = 0,
     read_failed: bool = false,
+    empty_validated: bool = false,
 
     /// Opens a UTF-8 path. The temporary terminated path is freed before return.
     pub fn openFile(allocator: std.mem.Allocator, format: Format, path: []const u8, options: OpenOptions) Error!Archive {
@@ -112,8 +113,8 @@ pub const Archive = struct {
     }
 
     pub fn parseEntryAt(self: *Archive, offset: i64) Error!void {
-        if (offset < 0) return error.InvalidOffset;
         self.invalidateEntry();
+        if (offset < 0) return error.InvalidOffset;
         if (!c.ar_parse_entry_at(self.archive, @as(c.off64_t, @intCast(offset)))) {
             return error.ParseFailed;
         }
@@ -153,6 +154,7 @@ pub const Archive = struct {
         self.generation +%= 1;
         self.consumed = 0;
         self.read_failed = false;
+        self.empty_validated = false;
     }
 
     pub fn atEof(self: *Archive) bool {
@@ -208,7 +210,18 @@ pub const Entry = struct {
         const left = try self.remaining();
         if (self.archive.read_failed) return error.DecompressFailed;
         if (out.len > left) return error.EndOfEntry;
-        if (out.len == 0) return;
+        if (out.len == 0) {
+            // Empty ZIP/RAR entries still carry checksums and restrictions.
+            // A zero-sized caller buffer on a nonempty entry is only a no-op.
+            if (self.byte_size != 0 or self.archive.empty_validated) return;
+            var sentinel: u8 = 0;
+            if (!c.ar_entry_uncompress(self.archive.archive, &sentinel, 0)) {
+                self.archive.read_failed = true;
+                return error.DecompressFailed;
+            }
+            self.archive.empty_validated = true;
+            return;
+        }
         if (!c.ar_entry_uncompress(self.archive.archive, out.ptr, out.len)) {
             self.archive.read_failed = true;
             return error.DecompressFailed;
@@ -492,6 +505,7 @@ test "automatic format detection streams remaining bytes and invalidates stale e
     defer allocator.free(all);
     try std.testing.expectEqualStrings("abcdef", all);
     try std.testing.expectError(error.InvalidOffset, archive.seek(-1));
+    try std.testing.expectError(error.StaleEntry, found.remaining());
     try std.testing.expect((try archive.find("missing.txt")) == null);
     try std.testing.expectError(error.StaleEntry, found.remaining());
 }
@@ -880,4 +894,39 @@ test "real 7z fixture in memory iterates entries" {
     try std.testing.expectEqualSlices(u8, real_beta, second_data);
     try std.testing.expect((try archive.nextEntry()) == null);
     try std.testing.expect(archive.atEof());
+}
+
+test "empty ZIP extraction validates native checksum and encryption flags" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildZipSingleFileFixture(allocator, "empty", "", "");
+    defer allocator.free(bytes);
+    {
+        var archive = try Archive.openMemory(.zip, bytes, .{});
+        defer archive.deinit();
+        const entry = (try archive.next()).?;
+        const output = try entry.readAlloc(allocator, 0);
+        defer allocator.free(output);
+        try std.testing.expectEqual(@as(usize, 0), output.len);
+        var writer: std.Io.Writer = .fixed(&.{});
+        try entry.writeTo(&writer);
+    }
+    // Central-directory CRC is authoritative for this parser.
+    const central = 30 + "empty".len;
+    std.mem.writeInt(u32, bytes[central + 16 ..][0..4], 0x12345678, .little);
+    {
+        var archive = try Archive.openMemory(.zip, bytes, .{});
+        defer archive.deinit();
+        const entry = (try archive.next()).?;
+        try std.testing.expectError(error.DecompressFailed, entry.readAlloc(allocator, 0));
+        try std.testing.expectError(error.DecompressFailed, entry.read(&.{}));
+    }
+    std.mem.writeInt(u32, bytes[central + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u16, bytes[central + 8 ..][0..2], 1, .little);
+    {
+        var archive = try Archive.openMemory(.zip, bytes, .{});
+        defer archive.deinit();
+        const entry = (try archive.next()).?;
+        var writer: std.Io.Writer = .fixed(&.{});
+        try std.testing.expectError(error.DecompressFailed, entry.writeTo(&writer));
+    }
 }
