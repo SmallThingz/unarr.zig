@@ -15,7 +15,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0-dev.2984+cb7d2b056
+          version: 0.16.0
 
       - name: Zig fmt check
         shell: bash
@@ -26,11 +26,11 @@ jobs:
             -not -path './zig-pkg/*')
           zig fmt --check $files
 
-      - name: Static libc tests
+      - name: Debug tests
         run: zig build test
 
-      - name: System libc tests
-        run: zig build test -Dstatic_libc=false
+      - name: ReleaseSafe tests
+        run: zig build test -Doptimize=ReleaseSafe
 
       - name: Build check
         run: zig build check

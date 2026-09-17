@@ -66,7 +66,7 @@ pub fn build(b: *std.Build) void {
         .name = "unarr",
         .linkage = if (shared) .dynamic else .static,
         .version = unarr_version,
-        .use_lld = true,
+        .use_lld = target.result.ofmt != .macho,
         .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
     });
     lib.root_module.addIncludePath(upstream.path(""));
@@ -94,11 +94,27 @@ pub fn build(b: *std.Build) void {
     mod.addConfigHeader(header);
     if (shared) mod.addCMacro("UNARR_IS_SHARED_LIBRARY", "1");
     mod.linkLibrary(lib);
-    const tests = b.addTest(.{ .root_module = mod, .use_lld = true, .use_llvm = true });
+    const tests = b.addTest(.{ .root_module = mod, .use_lld = target.result.ofmt != .macho, .use_llvm = true });
     const run = b.addRunArtifact(tests);
     run.setCwd(b.path(""));
     b.step("test", "Run archive behavior and ownership tests").dependOn(&run.step);
+    b.step("test-bin", "Install tests for execution in a target runtime").dependOn(&b.addInstallArtifact(tests, .{}).step);
     const check = b.step("check", "Compile library and tests");
     check.dependOn(&lib.step);
     check.dependOn(&tests.step);
+    const example = b.addExecutable(.{
+        .name = "unarr-read",
+        .use_llvm = true,
+        .use_lld = target.result.ofmt != .macho,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/read.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "unarr", .module = mod }},
+        }),
+    });
+    const run_example = b.addRunArtifact(example);
+    run_example.setCwd(b.path(""));
+    b.step("example", "Read a real compressed ZIP through the Zig API").dependOn(&run_example.step);
+    check.dependOn(&example.step);
 }

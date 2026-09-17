@@ -1,369 +1,40 @@
-# 📚 Documentation
+# Archive API
 
-## Overview
+Requires Zig 0.16.0. The public module is `unarr`; raw interoperability is available explicitly through `unarr.c`.
 
-`unarr-zig` is a Zig wrapper around [`selmf/unarr`](https://github.com/selmf/unarr). It exposes:
+## Opening and ownership
 
-- low-level C symbols via `unarr.c`
-- a higher-level Zig API (`Archive`, `Entry`, `Format`, `Error`)
-- Zig-managed build integration for fetching and compiling upstream `unarr`
+- `Archive.openFile(allocator, format, path, options)` accepts a normal UTF-8 slice, rejects embedded NULs, and uses wide paths on Windows. The allocator owns only temporary path conversion.
+- `Archive.openMemory(format, bytes, options)` borrows bytes until `deinit`; keep them alive and unchanged.
+- `Archive.openStream(format, stream, options)` borrows a raw C stream. Close that stream after the archive is deinitialized; never seek it while reading an entry.
+- `.auto`, `.zip`, `.tar`, `.rar`, and `.@"7z"` select a format. `OpenOptions.zip_deflated_only` restricts ZIP methods to those allowed by upstream's deflate-only mode.
 
-Supported archive formats:
+Archives own native decoder resources, which upstream allocates through libc. Call `deinit` exactly once. Archive values must not be copied after opening, and their address must remain stable while entries are in use. Calls on an archive require external serialization.
 
-- `rar`
-- `tar`
-- `zip`
-- `7z`
+## Navigation
 
-## Requirements
+`next() !?Entry` returns an entry, null at EOF, or an error. `find(name) !?Entry` restarts the archive and matches the exact slice. `seek(offset) !Entry` returns a fresh entry at a previously obtained offset; negative offsets are rejected. Every navigation attempt invalidates previous entry handles, including failed lookups and EOF.
 
-- Zig `0.16.0-dev+`
-- C toolchain supported by your Zig target
+The previous `nextEntry`, `parseEntryAt`, and sentinel-name `parseEntryFor` methods remain for migration. Prefer `find` over `parseEntryFor`, whose boolean result cannot distinguish parse failure from a missing name.
 
-## Build and Test
+## Entries and extraction
 
-```bash
-zig build
-zig build test
-```
+Entry size, offset and raw Windows FILETIME (100 ns ticks since 1601) are captured values. `name()` and `rawName()` return borrowed slices, valid only until archive navigation or teardown; stale handles return null. Duplicate names if retaining them. Handles must not outlive their archive.
 
-Useful build flags:
+- `remaining() !usize` reports unread bytes.
+- `readSome(buffer) !usize` reads up to the buffer length; zero means EOF (or an empty buffer).
+- `read(buffer) !void` reads exactly the requested length. An oversized request returns `EndOfEntry` without consuming data.
+- `readAlloc(allocator, limit) ![]u8` allocates and reads only the remaining bytes. Free the result with the same allocator. A limit or allocation failure leaves the cursor unchanged.
+- `writeTo(writer: *std.Io.Writer) !void` streams remaining bytes through an 8 KiB scratch buffer. A writer error can occur after archive input has been consumed.
 
-```bash
-zig build -Dshared=true
-zig build -Denable_7z=false
-zig build -Dstatic_libc=false
-```
+Reads through an invalidated handle return `StaleEntry`. Decompression or checksum failure poisons the current entry cursor; navigation creates a new cursor. Allocation bounds limit returned buffers, not upstream decoder memory or CPU use. No automatic filesystem extraction occurs: archive names are untrusted and must not be joined to an output path without validation.
 
-- `-Dshared=true`: builds `libunarr` as a shared library
-- `-Denable_7z=false`: excludes 7z source set/defines
-- `-Dstatic_libc=false`: disables the default `ziglibc` static-libc link path
+ZIP comments are available through `globalCommentSize()` and `readGlobalComment(buffer)`. `runtimeVersion()` exposes native version fields and a borrowed version string.
 
-## Package Integration
+## Build and migration
 
-Add dependency:
+The package exports the `unarr` module and native `unarr` artifact, including its generated header. The same library artifact is reused by tests and consumers. `zig build check` compiles library and tests; `zig build test-bin` installs the test executable for a target runtime. `-Dshared=true` selects shared linkage.
 
-```bash
-zig fetch --save <repo-url>
-```
+The custom libc dependency and `-Dstatic_libc` option have been removed in favor of Zig's target libc support. Repository name: `unarr.zig`; module/dependency name remains `unarr`. `openFile` now takes an allocator and an ordinary path slice. Construct entries through navigation methods instead of struct literals. `readAlloc` after a partial read returns the unread suffix.
 
-`build.zig`:
-
-```zig
-const dep = b.dependency("unarr", .{
-    .target = target,
-    .optimize = optimize,
-});
-exe.root_module.addImport("unarr", dep.module("unarr"));
-```
-
-Then in Zig source:
-
-```zig
-const unarr = @import("unarr");
-```
-
-## API Reference
-
-### Types
-
-### `unarr.Error`
-
-Possible errors:
-
-- `OpenStreamFailed`
-- `OpenArchiveFailed`
-- `ParseFailed`
-- `DecompressFailed`
-- `EntryTooLarge`
-- `OutOfMemory`
-
-### `unarr.Format`
-
-Archive type selector:
-
-- `.rar`
-- `.tar`
-- `.zip`
-- `.@"7z"`
-
-### `unarr.OpenOptions`
-
-```zig
-pub const OpenOptions = struct {
-    zip_deflated_only: bool = false,
-};
-```
-
-Only affects ZIP opening behavior.
-
-### `unarr.Version`
-
-```zig
-pub const Version = struct {
-    packed_version: u32,
-    major: u8,
-    minor: u8,
-    patch: u8,
-    string: []const u8,
-};
-```
-
-### `unarr.runtimeVersion() Version`
-
-Returns runtime version from linked `unarr`.
-
-## `Archive`
-
-### `Archive.openFile(format, path_z, options)`
-
-Open archive by filesystem path (`[:0]const u8`, null-terminated).
-
-### `Archive.openMemory(format, bytes, options)`
-
-Open archive from memory buffer.
-
-### `Archive.openStream(format, stream_ptr, options)`
-
-Open from raw `*unarr.c.ar_stream`.
-
-Important: this API does **not** take stream ownership.
-
-### `archive.deinit()`
-
-Releases archive resources. Closes stream only for `openFile` and `openMemory`.
-
-### `archive.nextEntry() Error!?Entry`
-
-Iterates entries.
-
-- returns `Entry` when available
-- returns `null` at EOF
-- returns `error.ParseFailed` for parse errors
-
-### `archive.parseEntryAt(offset)`
-
-Repositions parser to a previously captured entry offset.
-
-### `archive.parseEntryFor(name_z)`
-
-Attempts to locate an entry by name. Returns `bool`.
-
-### `archive.atEof()`
-
-Returns parser EOF state.
-
-### `archive.globalCommentSize()` / `archive.readGlobalComment(buffer)`
-
-ZIP global comment helpers.
-
-## `Entry`
-
-### Metadata
-
-- `entry.name() ?[]const u8`
-- `entry.rawName() ?[]const u8`
-- `entry.offset() i64`
-- `entry.size() usize`
-- `entry.filetime() i64`
-
-### Data Reads
-
-- `entry.read(out)` reads exactly `out.len` bytes from current entry stream position
-- `entry.readAlloc(allocator, limit)` allocates full entry size with explicit upper bound
-
-## Usage Examples
-
-### 1. Inspect archive entries
-
-```zig
-const std = @import("std");
-const unarr = @import("unarr");
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const path_z = try allocator.dupeZ(u8, "/tmp/example.zip");
-    defer allocator.free(path_z);
-
-    var ar = try unarr.Archive.openFile(.zip, path_z, .{});
-    defer ar.deinit();
-
-    while (try ar.nextEntry()) |entry| {
-        const name = entry.name() orelse "(unnamed)";
-        std.debug.print("name={s} size={} offset={}\n", .{ name, entry.size(), entry.offset() });
-    }
-}
-```
-
-### 2. Read a specific entry by name
-
-```zig
-const std = @import("std");
-const unarr = @import("unarr");
-
-fn readNamed(path: []const u8, wanted: []const u8) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-
-    var ar = try unarr.Archive.openFile(.zip, path_z, .{});
-    defer ar.deinit();
-
-    const wanted_z = try allocator.dupeZ(u8, wanted);
-    defer allocator.free(wanted_z);
-
-    if (!ar.parseEntryFor(wanted_z)) return error.FileNotFound;
-
-    // parseEntryFor positions the parser on the matching entry
-    const entry: unarr.Entry = .{ .archive = &ar };
-    const bytes = try entry.readAlloc(allocator, 64 * 1024 * 1024);
-    defer allocator.free(bytes);
-
-    std.debug.print("read {d} bytes from {s}\n", .{ bytes.len, wanted });
-}
-```
-
-### 3. Random-access re-read by offset
-
-```zig
-const std = @import("std");
-const unarr = @import("unarr");
-
-fn rereadFirst(path: []const u8) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-
-    var ar = try unarr.Archive.openFile(.tar, path_z, .{});
-    defer ar.deinit();
-
-    const first = (try ar.nextEntry()) orelse return error.EndOfStream;
-    const off = first.offset();
-
-    const first_data = try first.readAlloc(allocator, 8 * 1024 * 1024);
-    defer allocator.free(first_data);
-
-    try ar.parseEntryAt(off);
-    const same_again: unarr.Entry = .{ .archive = &ar };
-    const second_data = try same_again.readAlloc(allocator, 8 * 1024 * 1024);
-    defer allocator.free(second_data);
-
-    try std.testing.expectEqualSlices(u8, first_data, second_data);
-}
-```
-
-### 4. Open from in-memory bytes
-
-```zig
-const std = @import("std");
-const unarr = @import("unarr");
-
-fn parseEmbedded(bytes: []const u8) !void {
-    var ar = try unarr.Archive.openMemory(.zip, bytes, .{});
-    defer ar.deinit();
-
-    while (try ar.nextEntry()) |entry| {
-        _ = entry.name();
-    }
-}
-```
-
-### 5. Read ZIP global comment
-
-```zig
-const std = @import("std");
-const unarr = @import("unarr");
-
-fn showComment(path: []const u8) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-
-    var ar = try unarr.Archive.openFile(.zip, path_z, .{});
-    defer ar.deinit();
-
-    const n = ar.globalCommentSize();
-    if (n == 0) return;
-
-    const buf = try allocator.alloc(u8, n);
-    defer allocator.free(buf);
-
-    const copied = ar.readGlobalComment(buf);
-    std.debug.print("comment: {s}\n", .{buf[0..copied]});
-}
-```
-
-### 6. Use `openStream` with explicit ownership
-
-```zig
-const std = @import("std");
-const unarr = @import("unarr");
-
-fn openWithExistingStream(data: []const u8) !void {
-    const stream = unarr.c.ar_open_memory(data.ptr, data.len) orelse return error.OpenStreamFailed;
-    defer unarr.c.ar_close(stream); // you own stream lifetime
-
-    var ar = try unarr.Archive.openStream(.zip, stream, .{});
-    defer ar.deinit(); // closes archive only, not stream
-
-    _ = try ar.nextEntry();
-}
-```
-
-## Error Handling Guidance
-
-Recommended pattern:
-
-```zig
-switch (err) {
-    error.OpenArchiveFailed => { /* unsupported/invalid format */ },
-    error.ParseFailed => { /* malformed entry or traversal failure */ },
-    error.DecompressFailed => { /* damaged compressed data */ },
-    error.EntryTooLarge => { /* increase limit or skip file */ },
-    error.OutOfMemory => { /* allocator pressure */ },
-    else => return err,
-}
-```
-
-## Behavioral Notes and Gotchas
-
-- `openFile` and `parseEntryFor` require null-terminated strings (`[:0]const u8`).
-- `parseEntryFor`/`parseEntryAt` reposition parser state; treat iteration as stateful.
-- `Entry` is a lightweight view over current archive parser state, not an owned snapshot.
-- `readAlloc` is bounded by your provided `limit`; use it to prevent pathological allocations.
-- String pointers from C are converted to Zig slices, but validity is tied to parser progression.
-- `filetime()` is raw upstream value; interpretation depends on archive format metadata.
-
-## Testing Strategy
-
-The repository test suite validates:
-
-- version mapping correctness
-- reject-empty and reject-invalid inputs
-- ZIP entry reading, comments, and random access by offset
-- TAR multi-entry traversal and name lookup
-- stream ownership contract for `openStream`
-
-Run:
-
-```bash
-zig build test
-```
-
-## Stability and Compatibility
-
-Current package version is pre-`1.0`. API and behavior may evolve while the wrapper matures.
-
-For compatibility-sensitive integration, pin commit hashes in your consuming `build.zig.zon`.
+LLVM and LLD are selected for package executables because Zig 0.16's native linker cannot handle the host GCC 16 CRT's SFrame relocations. The bundled LZMA SDK intentionally uses unaligned native loads; only its C alignment sanitizer is disabled, while other C checks remain enabled.

@@ -1,112 +1,43 @@
-# 📦 unarr-zig
+# unarr.zig
 
-Zig-first bindings and high-level API for [`selmf/unarr`](https://github.com/selmf/unarr), with Zig-managed dependency fetching and C library build.
-
-![Zig](https://img.shields.io/badge/Zig-0.16.0--dev%2B-f7a41d)
-![Formats](https://img.shields.io/badge/Formats-RAR%20%7C%20TAR%20%7C%20ZIP%20%7C%207z-2ea44f)
-![Build](https://img.shields.io/badge/Build-Zig%20build%20system-0366d6)
-
-## ⚡ Features
-
-- 🧩 **Pure Zig build orchestration**: upstream `unarr` is downloaded and compiled via `zig build`.
-- 🛠 **High-level wrapper API**: ergonomic `Archive`/`Entry` types over raw C symbols.
-- 📦 **Multi-format archive support**: RAR, TAR, ZIP, and 7z.
-- 🧪 **Integration-heavy tests**: deterministic ZIP/TAR fixtures, parsing, seek/reparse, and ownership checks.
-- 🔒 **Safe defaults**: explicit error surface (`Error`), bounded allocation reads (`readAlloc(limit)`).
-
-## 🚀 Quick Start
-
-```bash
-zig build
-zig build test
-```
-
-Build options:
-
-```bash
-zig build -Dshared=true      # build shared libunarr
-zig build -Denable_7z=false  # compile without 7z sources
-zig build -Dstatic_libc=false # use system libc instead of ziglibc
-```
-
-List all options/steps:
-
-```bash
-zig build -h
-zig build -l
-```
-
-## 🧭 API At A Glance
+Archive reading for Zig 0.16.0, backed by pinned unarr 1.2.0 sources. The build compiles C directly through `std.Build`; CMake, Make, an installed unarr library, and a separate C compiler are unnecessary.
 
 ```zig
 const std = @import("std");
 const unarr = @import("unarr");
 
-test "read first zip entry" {
-    var ar = try unarr.Archive.openFile(.zip, "/tmp/example.zip", .{});
-    defer ar.deinit();
-
-    const entry = (try ar.nextEntry()) orelse return error.TestUnexpectedResult;
-    const data = try entry.readAlloc(std.testing.allocator, 64 * 1024 * 1024);
-    defer std.testing.allocator.free(data);
-
-    std.debug.print("entry={s} size={}\n", .{ entry.name() orelse "(unnamed)", data.len });
+fn read(allocator: std.mem.Allocator, path: []const u8) !void {
+    var archive = try unarr.Archive.openFile(allocator, .auto, path, .{});
+    defer archive.deinit();
+    while (try archive.next()) |entry| {
+        const bytes = try entry.readAlloc(allocator, 16 * 1024 * 1024);
+        defer allocator.free(bytes);
+        std.debug.print("{s}: {d} bytes\n", .{ entry.name() orelse "(unnamed)", bytes.len });
+    }
 }
 ```
 
-Core surface:
+The API offers format detection, optional-entry iteration, slice-based lookup, bounded allocation, partial reads, and `std.Io.Writer` streaming. Stale entry handles reject reads instead of reading a different entry.
 
-- `unarr.Archive.openFile`, `openMemory`, `openStream`
-- `unarr.Archive.nextEntry`, `parseEntryAt`, `parseEntryFor`, `atEof`
-- `unarr.Entry.name`, `rawName`, `size`, `offset`, `read`, `readAlloc`
-- `unarr.runtimeVersion()`
+## Build
 
-## 📦 Installation (As Dependency)
-
-```bash
-zig fetch --save <this-repo-url>
+```sh
+zig build test
+zig build test -Doptimize=ReleaseSafe
+zig build example
+zig build check -Denable_7z=false
+zig build -Dshared=true
 ```
 
-In your `build.zig`:
+RAR, TAR, ZIP and 7z are available; `.auto` probes them. `-Denable_7z=false` removes 7z decoding and explicit 7z opens return `UnsupportedFormat`. Static libraries are the default. Zig's target libc replaces the former custom `ziglibc` dependency; `-Dstatic_libc` is removed. For a static Linux application, select a musl target in the consuming build.
+
+## Dependency
+
+Fetch a pinned commit from `https://github.com/SmallThingz/unarr.zig`, then import the module:
 
 ```zig
-const dep = b.dependency("unarr", .{
-    .target = target,
-    .optimize = optimize,
-});
+const dep = b.dependency("unarr", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("unarr", dep.module("unarr"));
 ```
 
-## 🧪 Testing and Validation
-
-```bash
-zig build test
-zig build check
-zig build
-```
-
-Current test coverage includes:
-
-- version consistency checks
-- invalid/empty archive rejection paths
-- ZIP entry reads, comments, and offset reparsing
-- TAR multi-entry iteration and lookup behavior
-- `openFile` and `openStream` ownership semantics
-
-## 📚 Documentation
-
-- [DOCUMENTATION.md](./DOCUMENTATION.md)
-- [SECURITY.md](./SECURITY.md)
-- [CONTRIBUTIONS.md](./CONTRIBUTIONS.md)
-
-## 🧱 Build Model
-
-This project pins upstream `selmf/unarr` in `build.zig.zon` and compiles the C sources directly from that fetched dependency.
-
-Generated headers (`unarr.h`) are produced during build from upstream `unarr.h.in` using Zig's `addConfigHeader`.
-
-Static-libc builds use a lazily fetched `ziglibc` dependency pinned in `build.zig.zon` and linked by default.
-
-## 📜 License
-
-GNU Lesser General Public License v3. See [LICENCE](./LICENCE).
+See [API and ownership](DOCUMENTATION.md), [security policy](SECURITY.md), and [license](LICENSE).

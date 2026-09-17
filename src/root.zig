@@ -525,6 +525,45 @@ test "corrupt entry bytes fail checksum and poison only the current read cursor"
     try std.testing.expectError(error.DecompressFailed, entry.read(&buffer));
 }
 
+test "RAR4 stored entry auto detection validates content and EOF" {
+    const allocator = std.testing.allocator;
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "Rar!\x1a\x07\x00");
+    var main = [_]u8{ 0, 0, 0x73, 0, 0, 13, 0, 0, 0, 0, 0, 0, 0 };
+    std.mem.writeInt(u16, main[0..2], @truncate(std.hash.Crc32.hash(main[2..])), .little);
+    try data.appendSlice(allocator, &main);
+    const name = "stored.txt";
+    const content = "RAR stored payload\x00\xff";
+    var header = [_]u8{0} ** (32 + name.len);
+    header[2] = 0x74;
+    std.mem.writeInt(u16, header[3..5], 0x8000, .little);
+    std.mem.writeInt(u16, header[5..7], header.len, .little);
+    std.mem.writeInt(u32, header[7..11], content.len, .little);
+    std.mem.writeInt(u32, header[11..15], content.len, .little);
+    header[15] = 3;
+    std.mem.writeInt(u32, header[16..20], std.hash.Crc32.hash(content), .little);
+    header[24] = 20;
+    header[25] = 0x30;
+    std.mem.writeInt(u16, header[26..28], name.len, .little);
+    std.mem.writeInt(u32, header[28..32], 0o100644, .little);
+    @memcpy(header[32..], name);
+    std.mem.writeInt(u16, header[0..2], @truncate(std.hash.Crc32.hash(header[2..])), .little);
+    try data.appendSlice(allocator, &header);
+    try data.appendSlice(allocator, content);
+    var end = [_]u8{ 0, 0, 0x7b, 0, 0, 7, 0 };
+    std.mem.writeInt(u16, end[0..2], @truncate(std.hash.Crc32.hash(end[2..])), .little);
+    try data.appendSlice(allocator, &end);
+    var archive = try Archive.openMemory(.auto, data.items, .{});
+    defer archive.deinit();
+    const entry = (try archive.next()).?;
+    try std.testing.expectEqualStrings(name, entry.name().?);
+    const decoded = try entry.readAlloc(allocator, 100);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, content, decoded);
+    try std.testing.expect((try archive.next()) == null);
+}
+
 test "open memory rejects empty slices" {
     try std.testing.expectError(error.OpenStreamFailed, Archive.openMemory(.zip, "", .{}));
     try std.testing.expectError(error.OpenStreamFailed, Archive.openMemory(.tar, "", .{}));
