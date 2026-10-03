@@ -1,6 +1,6 @@
 # unarr.zig
 
-Archive reading for Zig 0.16.0, backed by pinned unarr 1.2.0 sources. The build compiles C directly through `std.Build`; CMake, Make, an installed unarr library, and a separate C compiler are unnecessary.
+Archive reading for Zig 0.17.0, backed by pinned unarr 1.2.0 sources. The build compiles C directly through `std.Build`; CMake, Make, an installed unarr library, and a separate C compiler are unnecessary.
 
 ```zig
 const std = @import("std");
@@ -23,7 +23,7 @@ The API offers format detection, optional-entry iteration, slice-based lookup, b
 
 ```sh
 zig build test
-zig build test -Doptimize=ReleaseSafe
+zig build test -Doptimize=safe
 zig build example
 zig build check -Denable_7z=false
 zig build -Dshared=true

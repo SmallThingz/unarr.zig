@@ -94,6 +94,15 @@ pub fn build(b: *std.Build) void {
     mod.addConfigHeader(header);
     if (shared) mod.addCMacro("UNARR_IS_SHARED_LIBRARY", "1");
     mod.linkLibrary(lib);
+    const headers = b.addWriteFiles();
+    const bindings = b.addTranslateC(.{
+        .root_source_file = headers.add("unarr_api.h", "#include <unarr.h>\n"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bindings.addConfigHeader(header);
+    if (shared) bindings.defineCMacro("UNARR_IS_SHARED_LIBRARY", "1");
+    mod.addImport("unarr_c", bindings.createModule());
     const tests = b.addTest(.{ .root_module = mod, .use_lld = target.result.ofmt != .macho, .use_llvm = true });
     const run = b.addRunArtifact(tests);
     run.setCwd(b.path(""));

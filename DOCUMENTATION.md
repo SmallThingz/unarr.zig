@@ -1,6 +1,6 @@
 # Archive API
 
-Requires Zig 0.16.0. The public module is `unarr`; raw interoperability is available explicitly through `unarr.c`.
+Requires Zig 0.17.0. The public module is `unarr`; raw interoperability is available explicitly through `unarr.c`.
 
 ## Opening and ownership
 

@@ -1,8 +1,6 @@
 const std = @import("std");
 
-pub const c = @cImport({
-    @cInclude("unarr.h");
-});
+pub const c = @import("unarr_c");
 
 pub const Error = error{
     OpenStreamFailed,
@@ -58,7 +56,7 @@ pub const Archive = struct {
     /// Opens a UTF-8 path. The temporary terminated path is freed before return.
     pub fn openFile(allocator: std.mem.Allocator, format: Format, path: []const u8, options: OpenOptions) Error!Archive {
         if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
         const stream = if (@import("builtin").os.tag == .windows) blk: {
             const wide_path = std.unicode.utf8ToUtf16LeAllocZ(allocator, path) catch |err| return switch (err) {
@@ -416,7 +414,7 @@ fn buildTarFixture(allocator: std.mem.Allocator, entries: []const TarFixtureEntr
     for (entries) |entry| {
         std.debug.assert(entry.name.len <= 100);
 
-        var header = [_]u8{0} ** 512;
+        var header: [512]u8 = @splat(0);
         @memcpy(header[0..entry.name.len], entry.name);
         writeTarOctal(header[100..108], 0o644);
         writeTarOctal(header[108..116], 0);
@@ -451,7 +449,7 @@ fn expectNamedEntryData(
     name: []const u8,
     expected: []const u8,
 ) !void {
-    const name_z = try allocator.dupeZ(u8, name);
+    const name_z = try allocator.dupeSentinel(u8, name, 0);
     defer allocator.free(name_z);
 
     try std.testing.expect(archive.parseEntryFor(name_z));
@@ -549,7 +547,7 @@ test "RAR4 stored entry auto detection validates content and EOF" {
     try data.appendSlice(allocator, &main);
     const name = "stored.txt";
     const content = "RAR stored payload\x00\xff";
-    var header = [_]u8{0} ** (32 + name.len);
+    var header: [32 + name.len]u8 = @splat(0);
     header[2] = 0x74;
     std.mem.writeInt(u16, header[3..5], 0x8000, .little);
     std.mem.writeInt(u16, header[5..7], header.len, .little);
@@ -634,7 +632,7 @@ test "zip fixture supports entry reading, offsets, and comments" {
     try reparsed.read(read_buf[0..]);
     try std.testing.expectEqualStrings(payload, read_buf[0..]);
 
-    const file_name_z = try allocator.dupeZ(u8, file_name);
+    const file_name_z = try allocator.dupeSentinel(u8, file_name, 0);
     defer allocator.free(file_name_z);
     try std.testing.expect(archive.parseEntryFor(file_name_z));
     const named = currentEntry(&archive);
@@ -670,7 +668,7 @@ test "openFile works with generated zip fixture" {
     });
     defer allocator.free(abs_path);
 
-    const abs_path_z = try allocator.dupeZ(u8, abs_path);
+    const abs_path_z = try allocator.dupeSentinel(u8, abs_path, 0);
     defer allocator.free(abs_path_z);
 
     var archive = try Archive.openFile(allocator, .zip, abs_path_z, .{});
@@ -726,7 +724,7 @@ test "parseEntryFor locates entries and misses unknown names" {
     var archive = try Archive.openMemory(.tar, tar, .{});
     defer archive.deinit();
 
-    const exists = try allocator.dupeZ(u8, "b.txt");
+    const exists = try allocator.dupeSentinel(u8, "b.txt", 0);
     defer allocator.free(exists);
     try std.testing.expect(archive.parseEntryFor(exists));
     const found = currentEntry(&archive);
@@ -734,7 +732,7 @@ test "parseEntryFor locates entries and misses unknown names" {
     defer allocator.free(found_data);
     try std.testing.expectEqualStrings("BBBB", found_data);
 
-    const missing = try allocator.dupeZ(u8, "missing.txt");
+    const missing = try allocator.dupeSentinel(u8, "missing.txt", 0);
     defer allocator.free(missing);
     try std.testing.expect(!archive.parseEntryFor(missing));
 }
@@ -768,7 +766,7 @@ test "real zip fixture from disk decompresses deflate entries" {
     const real_beta = try readFixtureFile(allocator, "testdata/src/beta.bin");
     defer allocator.free(real_beta);
 
-    const path_z = try allocator.dupeZ(u8, "testdata/archives/real-deflate.zip");
+    const path_z = try allocator.dupeSentinel(u8, "testdata/archives/real-deflate.zip", 0);
     defer allocator.free(path_z);
 
     var archive = try Archive.openFile(allocator, .zip, path_z, .{});
@@ -778,7 +776,7 @@ test "real zip fixture from disk decompresses deflate entries" {
     try expectNamedEntryData(&archive, allocator, "alpha.txt", real_alpha);
     try expectNamedEntryData(&archive, allocator, "beta.bin", real_beta);
 
-    const missing = try allocator.dupeZ(u8, "missing.file");
+    const missing = try allocator.dupeSentinel(u8, "missing.file", 0);
     defer allocator.free(missing);
     try std.testing.expect(!archive.parseEntryFor(missing));
 }
@@ -823,7 +821,7 @@ test "real tar fixture from disk parses entries" {
     const real_beta = try readFixtureFile(allocator, "testdata/src/beta.bin");
     defer allocator.free(real_beta);
 
-    const path_z = try allocator.dupeZ(u8, "testdata/archives/real.tar");
+    const path_z = try allocator.dupeSentinel(u8, "testdata/archives/real.tar", 0);
     defer allocator.free(path_z);
 
     var archive = try Archive.openFile(allocator, .tar, path_z, .{});
@@ -858,7 +856,7 @@ test "real 7z fixture from disk decompresses entries" {
     const real_beta = try readFixtureFile(allocator, "testdata/src/beta.bin");
     defer allocator.free(real_beta);
 
-    const path_z = try allocator.dupeZ(u8, "testdata/archives/real.7z");
+    const path_z = try allocator.dupeSentinel(u8, "testdata/archives/real.7z", 0);
     defer allocator.free(path_z);
 
     var archive = try Archive.openFile(allocator, .@"7z", path_z, .{});

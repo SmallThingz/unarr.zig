@@ -4,7 +4,7 @@
 
 Requirements:
 
-- Zig `0.16.0`
+- Zig `0.17.0`
 - standard C toolchain supported by Zig on your platform
 
 Common commands:
