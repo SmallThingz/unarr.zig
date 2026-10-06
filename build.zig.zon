@@ -33,7 +33,7 @@
     // internet connectivity.
     .dependencies = .{
         .unarr_upstream = .{
-            .url = "https://github.com/selmf/unarr/archive/00799b5d6a7456eff37276ad376d1715ee222e02.tar.gz",
+            .url = "git+https://github.com/selmf/unarr.git#00799b5d6a7456eff37276ad376d1715ee222e02",
             .hash = "N-V-__8AABWMCgDgDrwfEHLcf0rwMuWfSTEMZsTxuSs3oRJs",
         },
     },
